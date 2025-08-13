@@ -3,13 +3,14 @@ import json
 import re
 import asyncio
 import requests
-from typing import Dict, List, Any, Optional, Union, Callable
+from typing import Dict, List, Any, Optional, Union, Callable,Literal
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 import subprocess
 from datetime import datetime
 from groq import Groq
 from enum import Enum
+from pydantic import BaseModel
 
 class TaskType(Enum):
     """Types of tasks the agent can handle"""
@@ -22,6 +23,7 @@ class TaskType(Enum):
     PROBLEM_SOLVING = "problem_solving"
     SYSTEM_ADMINISTRATION = "system_administration"
     WEB_SCRAPING = "web_scraping"
+    EDIT_FILE = "edit_file"
     API_INTEGRATION = "api_integration"
     WEB_SEARCH="web_search"
     GENERAL = "general"
@@ -87,6 +89,85 @@ class BaseTool(ABC):
         """Validate input parameters"""
         return True
 
+class EditFileTool(BaseTool):
+    """Edit existing files by exact text replacement"""
+    @property
+    def name(self) -> str:
+        return "edit_file"
+
+    @property
+    def description(self) -> str:
+        return ("Modify EXISTING files by exact text replacement. Use this for files that already exist. "
+                "MANDATORY: Always read_file first to see current content before editing. "
+                "Text must match exactly including whitespace. "
+                "Example: {\"file_path\": \"src/app.js\", \"old_text\": \"const x = 1;\", \"new_text\": \"const x = 2;\"}")
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to file to edit. For files in current directory use just filename (e.g. 'app.js'). For subdirectories use 'src/app.js'. DO NOT use absolute paths or leading slashes."
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "Exact text to replace (must match perfectly including spaces/newlines)"
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Replacement text"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace all occurrences (default: false)",
+                    "default": False
+                }
+            },
+            "required": ["file_path", "old_text", "new_text"]
+        }
+
+    def execute(self, **kwargs) -> ToolResult:
+        import os
+        file_path = kwargs.get('file_path')
+        old_text = kwargs.get('old_text')
+        new_text = kwargs.get('new_text')
+        replace_all = kwargs.get('replace_all', False)
+        # Validate required parameters
+        if not file_path or not isinstance(file_path, str):
+            return ToolResult(False, "", "Missing or invalid 'file_path' parameter")
+        if not old_text or not isinstance(old_text, str):
+            return ToolResult(False, "", "Missing or invalid 'old_text' parameter")
+        if new_text is None or not isinstance(new_text, str):
+            return ToolResult(False, "", "Missing or invalid 'new_text' parameter")
+        try:
+            # Only allow relative paths, no leading slashes
+            if os.path.isabs(file_path) or file_path.startswith("/"):
+                return ToolResult(False, "", "Absolute paths or leading slashes are not allowed")
+            resolved_path = os.path.abspath(file_path)
+            if not os.path.exists(resolved_path):
+                return ToolResult(False, "", f"File does not exist: {file_path}")
+            # Read current content
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                original_content = f.read()
+            # Perform the replacement
+            if replace_all:
+                updated_content = original_content.replace(old_text, new_text)
+                replacement_count = original_content.count(old_text)
+            else:
+                updated_content = original_content.replace(old_text, new_text, 1)
+                replacement_count = 1 if old_text in original_content else 0
+            # Write the updated content
+            with open(resolved_path, "w", encoding="utf-8") as f:
+                f.write(updated_content)
+            if replacement_count > 0:
+                return ToolResult(True, f"Replaced {replacement_count} occurrence(s) in {file_path}")
+            else:
+                return ToolResult(False, "", f"No occurrences of '{old_text}' found in {file_path}")
+        except Exception as e:
+            return ToolResult(False, "", f"Error: Failed to edit file - {e}")
+        
 class FileSystemTool(BaseTool):
     """Enhanced file system operations tool"""
     
@@ -133,7 +214,6 @@ class FileSystemTool(BaseTool):
                 "copy_file": self._copy_file,
                 "move_file": self._move_file
             }
-            
             if operation in operations:
                 return operations[operation](**kwargs)
             else:
@@ -517,7 +597,7 @@ class GroqLLMEngine:
 5. estimated_steps: Number of execution steps
 6. reasoning: Brief explanation
 
-Available task types: code_generation, file_management, research, data_analysis, automation, creative_writing, problem_solving, system_administration, web_scraping, api_integration, general
+Available task types: code_generation, file_management, edit ,research, data_analysis, automation, creative_writing, problem_solving, system_administration, web_scraping, api_integration, general
 
 Available tools: """ + str(available_tools or [])
 
@@ -581,45 +661,147 @@ Available tools: """ + str(available_tools or [])
         return response.choices[0].message
     
     def _fallback_analysis(self, user_request: str) -> Dict[str, Any]:
-        """Simple pattern-based analysis as fallback"""
-        user_lower = user_request.lower()
-        
-        # Enhanced code generation detection
-        code_keywords = ["code", "program", "script", "develop", "python", "gui", "game", "create", "build", "generate"]
-        realtime_keywords = [
-            "stock", "price", "current", "live", "today", "quote", "market", "weather", "news", "rate", "exchange", "crypto", "share", "value"
-        ]
-        if any(word in user_lower for word in code_keywords):
-            task_type = "code_generation"
-            tools = ["filesystem", "command"]
-        elif any(word in user_lower for word in ["file", "directory", "folder", "organize"]):
-            task_type = "file_management"
-            tools = ["filesystem"]
-        elif any(word in user_lower for word in ["research", "find", "search", "information"]):
-            task_type = "research"
-            tools = ["web", "data_processing"]
-        elif any(word in user_lower for word in realtime_keywords):
-            task_type = "research"
-            tools = ["web"]
-        elif any(word in user_lower for word in ["analyze", "data", "statistics", "process"]):
-            task_type = "data_analysis"
-            tools = ["data_processing", "filesystem"]
-        elif any(word in user_lower for word in ["write", "story", "article"]):
-            task_type = "creative_writing"
-            tools = ["filesystem"]
-        else:
-            task_type = "general"
-            tools = ["filesystem"]
+        """Semantic analysis for file editing/formatting and other tasks using LLM intent classification"""
+        import re
+        # Semantic intent classification using LLM
+        intent_prompt = (
+            "Classify the following user request by intent. Understand the Semantic Meaning behind the user's question. "
+            "When the user asks for real-time data always give intent as web_search only."
+            "Is it asking to edit or format a file, generate code, manage files, or something else? "
+            "Return a JSON object with 'intent', 'filename' (if any), and 'reasoning'.\n"
+            "You have Following Lits of intents (code_generation, file_management, file_editing ,research, data_analysis, automation, creative_writing, problem_solving, system_administration, web_scraping, web_search, api_integration, general)"
+            f"Request: {user_request}"
+        )
+        try:
+            class RequestIntent(BaseModel):
+                intent:Literal["code_generation", "file_management", "file_editing" ,"research", "data_analysis", "automation", "creative_writing", "problem_solving", "system_administration", "web_scraping", "web_search", "api_integration", "general"]
+                filename:str|None
+                reasoning:str
+                
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert intent classifier for agentic tasks."},
+                    {"role": "user", "content": intent_prompt}
+                ],
+                temperature=0.0,
+                max_tokens=300,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "intent_classification",
+                        "schema": RequestIntent.model_json_schema()
+                    }
+                }
+                
+            )
+            content = response.choices[0].message.content.strip()
+            if content.startswith("```json"):
+                content = content[7:-3]
+            elif content.startswith("```"):
+                content = content[3:-3]
+            intent_result = json.loads(content)
+            intent = intent_result.get("intent", "general")
+            filename = intent_result.get("filename")
+            reasoning = intent_result.get("reasoning", "")
+            # Map intent to task_type and tools
+            if intent in ["file_editing", "formatting"]:
+                task_type = "file_editing"
+                tools = ["filesystem", "edit_file", "llm_generation"]
+                if not filename:
+                    # Try to extract filename from user_request
+                    file_match = re.search(r"\b([\w\-]+\.py)\b", user_request)
+                    filename = file_match.group(1) if file_match else "unknown.py"
+                reasoning = reasoning or f"LLM classified as file editing/formatting for {filename}"
+            elif intent == "code_generation":
+                task_type = "code_generation"
+                tools = ["filesystem", "command"]
+                reasoning = reasoning or "LLM classified as code generation"
+            elif intent == "file_management":
+                task_type = "file_management"
+                tools = ["filesystem"]
+                reasoning = reasoning or "LLM classified as file management"
+            elif intent == "web_search":
+                task_type = "web_search"
+                tools = ["web"]
+                reasoning = reasoning or "LLM classified as web_search (real-time data)"
+            elif intent == "research":
+                task_type = "research"
+                tools = ["web", "data_processing"]
+                reasoning = reasoning or "LLM classified as research"
+            elif intent == "data_analysis":
 
-        
-        return {
-            "task_type": task_type,
-            "complexity": "medium",
-            "required_tools": tools,
-            "subtasks": [user_request],
-            "estimated_steps": 2,
-            "reasoning": f"Detected as {task_type} task based on keywords"
-        }
+                task_type = "data_analysis"
+                tools = ["data_processing", "filesystem"]
+                reasoning = reasoning or "LLM classified as data analysis"
+            elif intent == "creative_writing":
+                task_type = "creative_writing"
+                tools = ["filesystem"]
+                reasoning = reasoning or "LLM classified as creative writing"
+            else:
+                task_type = "general"
+                tools = ["filesystem"]
+                reasoning = reasoning or "LLM classified as general"
+            return {
+                "task_type": task_type,
+                "complexity": "medium",
+                "required_tools": tools,
+                "subtasks": [user_request],
+                "estimated_steps": 2,
+                "reasoning": reasoning
+            }
+        except Exception as e:
+            # Fallback to pattern-based analysis if LLM fails
+            user_lower = user_request.lower()
+            file_edit_keywords = ["edit", "format", "refactor", "clean up", "pep8", "lint", "beautify"]
+            file_pattern = r"\b([\w\-]+\.py)\b"
+            file_match = re.search(file_pattern, user_lower)
+            if any(word in user_lower for word in file_edit_keywords) and file_match:
+                filename = file_match.group(1)
+                task_type = "file_editing"
+                tools = ["filesystem", "edit_file", "llm_generation"]
+                reasoning = f"Detected file editing/formatting task for {filename}"
+            else:
+                code_keywords = ["code", "program", "script", "develop", "python", "gui", "game", "create", "build", "generate"]
+                realtime_keywords = [
+                    "stock", "price", "current", "live", "today", "quote", "market", "weather", "news", "rate", "exchange", "crypto", "share", "value"
+                ]
+                if any(word in user_lower for word in code_keywords):
+                    task_type = "code_generation"
+                    tools = ["filesystem", "command"]
+                    reasoning = "Detected as code_generation task based on keywords"
+                elif any(word in user_lower for word in ["file", "directory", "folder", "organize"]):
+                    task_type = "file_management"
+                    tools = ["filesystem"]
+                    reasoning = "Detected as file_management task based on keywords"
+                elif any(word in user_lower for word in ["research", "find", "search", "information"]):
+                    task_type = "research"
+                    tools = ["web", "data_processing"]
+                    reasoning = "Detected as research task based on keywords"
+                elif any(word in user_lower for word in realtime_keywords):
+                    task_type = "web_search"
+                    tools = ["web"]
+                    reasoning = "Detected as web_search (real-time data) based on keywords"
+                elif any(word in user_lower for word in ["analyze", "data", "statistics", "process"]):
+                    task_type = "data_analysis"
+                    tools = ["data_processing", "filesystem"]
+                    reasoning = "Detected as data_analysis task based on keywords"
+                elif any(word in user_lower for word in ["write", "story", "article"]):
+                    task_type = "creative_writing"
+                    tools = ["filesystem"]
+                    reasoning = "Detected as creative_writing task based on keywords"
+                else:
+                    task_type = "general"
+                    tools = ["filesystem"]
+                    reasoning = "General task analysis"
+            return {
+                "task_type": task_type,
+                "complexity": "medium",
+                "required_tools": tools,
+                "subtasks": [user_request],
+                "estimated_steps": 2,
+                "reasoning": reasoning
+            }
 
     
     def plan_execution(self, analysis: Dict[str, Any], user_request: str) -> List[Dict[str, Any]]:
@@ -629,7 +811,7 @@ Available tools: """ + str(available_tools or [])
 
 Return a JSON array of steps, each with:
 - step: number
-- action: tool name (filesystem, command, web, data_processing, llm_generation)
+- action: tool name (filesystem,edit, command, web, data_processing, llm_generation)
 - operation: specific operation
 - parameters: parameters for the operation
 - description: human-readable description
@@ -690,8 +872,43 @@ Create an execution plan:"""
     def _create_simple_plan(self, analysis: Dict[str, Any], user_request: str) -> List[Dict[str, Any]]:
         """Create a simple fallback plan"""
         task_type = analysis.get("task_type", "general")
-        
-        if task_type == "code_generation":
+        if task_type == "file_editing":
+            import re
+            user_text = analysis.get("subtasks", [""])[0]
+            file_match = re.search(r"\b([\w\-]+\.py)\b", user_text)
+            filename = file_match.group(1) if file_match else "unknown.py"
+            return [
+                {
+                    "step": 1,
+                    "action": "filesystem",
+                    "operation": "read_file",
+                    "parameters": {"path": filename},
+                    "description": f"Read the content of {filename}"
+                },
+                {
+                    "step": 2,
+                    "action": "llm_generation",
+                    "operation": "format_code",
+                    "parameters": {
+                        "request": "Format this Python code to PEP8 and clean up:\n{{step_1.data.content}}",
+                        "language": "python"
+                    },
+                    "description": f"Format the code in {filename} using LLM"
+                },
+                {
+                    "step": 3,
+                    "action": "edit_file",
+                    "operation": "edit_file",
+                    "parameters": {
+                        "file_path": filename,
+                        "old_text": "{{step_1.data.content}}",
+                        "new_text": "{{step_2.data.content}}",
+                        "replace_all": True
+                    },
+                    "description": f"Write the formatted code back to {filename}"
+                }
+            ]
+        elif task_type == "code_generation":
             return [
                 {
                     "step": 1,
@@ -718,7 +935,7 @@ Create an execution plan:"""
                     "description": "List current directory contents"
                 }
             ]
-        elif task_type == "research" and "web" in analysis.get("required_tools", []):
+        elif task_type == "web_search" or (task_type == "research" and "web" in analysis.get("required_tools", [])):
             return [
                 {
                     "step": 1,
@@ -789,6 +1006,7 @@ class GeneralGroqAgent:
         # Initialize tools
         self.tools = {
             'filesystem': FileSystemTool(),
+            'edit_file': EditFileTool(),
             'command': CommandTool(),
             'web': WebTool(),
             'data_processing': DataProcessingTool()
