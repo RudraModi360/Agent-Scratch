@@ -140,7 +140,7 @@ class FileSystemTool(BaseTool):
         Cleans Markdown-like content into raw code.
         This can be replaced with an LLM call for smarter extraction.
         """
-        self.client = Groq(api_key='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')
+        self.client = Groq(api_key=os.getenv('GROQ_API_KEY'))
         self.model = "openai/gpt-oss-120b"
         cleaned=self.client.chat.completions.create(
                 model=self.model,
