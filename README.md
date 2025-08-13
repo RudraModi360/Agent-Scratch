@@ -1,4 +1,4 @@
-# Agent.py – General Purpose AI Agent (Groq-powered)
+# Agent from Scratch– General Purpose AI Agent (Groq-powered)
 
 ## Overview
 
