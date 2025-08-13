@@ -23,6 +23,7 @@ class TaskType(Enum):
     SYSTEM_ADMINISTRATION = "system_administration"
     WEB_SCRAPING = "web_scraping"
     API_INTEGRATION = "api_integration"
+    WEB_SEARCH="web_search"
     GENERAL = "general"
 
 @dataclass
@@ -321,8 +322,11 @@ class CommandTool(BaseTool):
             "required": ["command"]
         }
     
-    def execute(self, command, **kwargs) -> ToolResult:
+    def execute(self, **kwargs) -> ToolResult:
         try:
+            command = kwargs.get('command')
+            if not command:
+                return ToolResult(False, '', 'Missing required parameter: command')
             result = subprocess.run(
                 command,
                 shell=kwargs.get('shell', True),
@@ -367,57 +371,45 @@ class WebTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "operation": {"type": "string", "enum": ["get", "post", "download", "headers"]},
                 "url": {"type": "string"},
                 "data": {"type": "object"},
                 "headers": {"type": "object"},
                 "timeout": {"type": "integer", "default": 30}
             },
-            "required": ["operation", "url"]
+            "required": ["data","description"]
         }
     
-    def execute(self, operation: str, url: str, **kwargs) -> ToolResult:
+    def execute(self, **kwargs) -> ToolResult:
         try:
-            timeout = kwargs.get('timeout', 30)
-            headers = kwargs.get('headers', {})
-            
-            if operation == "get":
-                response = requests.get(url, headers=headers, timeout=timeout)
-                return ToolResult(
-                    success=response.status_code == 200,
-                    output=f"HTTP {response.status_code}: {len(response.text)} characters",
-                    data={
-                        "status_code": response.status_code,
-                        "content": response.text[:5000],  # Limit content size
-                        "headers": dict(response.headers),
-                        "url": url
-                    }
-                )
-            
-            elif operation == "post":
-                data = kwargs.get('data', {})
-                response = requests.post(url, data=data, headers=headers, timeout=timeout)
-                return ToolResult(
-                    success=response.status_code in [200, 201],
-                    output=f"HTTP {response.status_code}: POST request completed",
-                    data={
-                        "status_code": response.status_code,
-                        "content": response.text[:1000],
-                        "url": url
-                    }
-                )
-            
-            elif operation == "headers":
-                response = requests.head(url, headers=headers, timeout=timeout)
-                return ToolResult(
-                    success=response.status_code == 200,
-                    output=f"Headers retrieved for {url}",
-                    data={"headers": dict(response.headers), "status_code": response.status_code}
-                )
-            
-            else:
-                return ToolResult(False, "", f"Unknown web operation: {operation}")
-                
+            data = kwargs.get("data", "Do the web search")
+            description = kwargs.get("description", "Do the web search")
+
+            # Build the user request string
+            user_request = f"Search the web for: {data}, for additional context use Description : {description}"
+
+            # Get Groq API key from environment
+            from os import getenv
+            groq_api_key = getenv('GROQ_API_KEY')
+            if not groq_api_key:
+                return ToolResult(False, '', 'Missing GROQ_API_KEY environment variable')
+
+            # Initialize Groq LLM Engine
+            engine = GroqLLMEngine(groq_api_key)
+
+            # Perform agentic tool call
+            llm_response = engine.agentic_tool_call(engine.client,user_request)
+
+            # Return a successful ToolResult with details
+            return ToolResult(
+                success=True,
+                output=llm_response.content,
+                data={
+                    "content":llm_response.content,
+                    "reasoning": llm_response.reasoning,
+                    "tool_calls": llm_response.tool_calls
+                }
+            )
+
         except Exception as e:
             return ToolResult(False, "", str(e))
 
@@ -448,8 +440,14 @@ class DataProcessingTool(BaseTool):
             "required": ["operation", "data"]
         }
     
-    def execute(self, operation: str, data: str, **kwargs) -> ToolResult:
+    def execute(self, **kwargs) -> ToolResult:
         try:
+            operation = kwargs.get('operation')
+            data = kwargs.get('data')
+            if not operation:
+                return ToolResult(False, '', 'Missing required parameter: operation')
+            if data is None:
+                return ToolResult(False, '', 'Missing required parameter: data')
             if operation == "parse_json":
                 parsed = json.loads(data)
                 return ToolResult(True, "JSON parsed successfully", data={"parsed": parsed})
@@ -485,8 +483,8 @@ class DataProcessingTool(BaseTool):
                     }
                     
                     return ToolResult(True, "Statistics calculated", data=stats)
-                except:
-                    return ToolResult(False, "", "Could not process numeric data")
+                except Exception as e:
+                    return ToolResult(False, "", f"Could not process numeric data: {str(e)}")
             
             else:
                 return ToolResult(False, "", f"Unknown data operation: {operation}")
@@ -508,7 +506,7 @@ class GroqLLMEngine:
         self.model = model
         self.conversation_history = []
     
-    def analyze_request(self, user_request: str, available_tools: List[str] = None) -> Dict[str, Any]:
+    def analyze_request(self, user_request: str, available_tools: Optional[List[str]] = None) -> Dict[str, Any]:
         """Analyze user request to determine task type and requirements"""
         
         system_prompt = """You are a task analysis expert. Analyze the user request and return a JSON response with:
@@ -523,7 +521,11 @@ Available task types: code_generation, file_management, research, data_analysis,
 
 Available tools: """ + str(available_tools or [])
 
-        user_prompt = f"Analyze this request: {user_request}"
+        user_prompt = f"""
+        Analyze this request: {user_request} ,
+        You have following list of tools : {available_tools} ,
+        Now by analysing the user request , pick the best suited [action,required_tools] for fulfilling this tasks.
+        """
 
         try:
             response = self.client.chat.completions.create(
@@ -564,12 +566,29 @@ Available tools: """ + str(available_tools or [])
         except Exception as e:
             return self._fallback_analysis(user_request)
     
+    def agentic_tool_call(self,client:Groq,user_input:str):
+        client = Groq()
+
+        response = client.chat.completions.create(
+            model="compound-beta",
+            messages=[
+                {
+                    "role": "user",
+                    "content": user_input
+                }
+            ]
+        )
+        return response.choices[0].message
+    
     def _fallback_analysis(self, user_request: str) -> Dict[str, Any]:
         """Simple pattern-based analysis as fallback"""
         user_lower = user_request.lower()
         
         # Enhanced code generation detection
         code_keywords = ["code", "program", "script", "develop", "python", "gui", "game", "create", "build", "generate"]
+        realtime_keywords = [
+            "stock", "price", "current", "live", "today", "quote", "market", "weather", "news", "rate", "exchange", "crypto", "share", "value"
+        ]
         if any(word in user_lower for word in code_keywords):
             task_type = "code_generation"
             tools = ["filesystem", "command"]
@@ -579,6 +598,9 @@ Available tools: """ + str(available_tools or [])
         elif any(word in user_lower for word in ["research", "find", "search", "information"]):
             task_type = "research"
             tools = ["web", "data_processing"]
+        elif any(word in user_lower for word in realtime_keywords):
+            task_type = "research"
+            tools = ["web"]
         elif any(word in user_lower for word in ["analyze", "data", "statistics", "process"]):
             task_type = "data_analysis"
             tools = ["data_processing", "filesystem"]
@@ -588,6 +610,7 @@ Available tools: """ + str(available_tools or [])
         else:
             task_type = "general"
             tools = ["filesystem"]
+
         
         return {
             "task_type": task_type,
@@ -617,6 +640,13 @@ Focus on practical, executable steps. Be specific with file paths and operations
         planning_prompt = f"""
 User Request: {user_request}
 Analysis: {json.dumps(analysis, indent=2)}
+
+Use this Analysis and user request , understand the user intent and according to it.make a proper plan for this.
+
+## Note :
+- you have following actions to take tool name (filesystem, command, web, data_processing, llm_generation).
+- take the proper actions as per user intent.
+- when the user asks something about real-time data or factual data always try to do the web_seacrh for it.
 
 Create an execution plan:"""
 
@@ -686,6 +716,16 @@ Create an execution plan:"""
                     "operation": "list_directory",
                     "parameters": {"path": "."},
                     "description": "List current directory contents"
+                }
+            ]
+        elif task_type == "research" and "web" in analysis.get("required_tools", []):
+            return [
+                {
+                    "step": 1,
+                    "action": "web",
+                    "operation": "search",
+                    "parameters": {"data": user_request, "description": user_request},
+                    "description": "Search the web for real-time/factual data"
                 }
             ]
         else:
@@ -763,7 +803,7 @@ class GeneralGroqAgent:
         self.context = {"working_directory": self.current_directory}
         self.execution_history = []
     
-    def process_request(self, user_input: str) -> str:
+    def process_request(self, user_input: str) -> Dict[str, Any]:
         """Process user request - main agent entry point (agentic loop)"""
         self.chat_history.append(Message("user", user_input))
 
@@ -814,8 +854,8 @@ class GeneralGroqAgent:
             "goal_met": state["goal_met"],
             "timestamp": datetime.now().isoformat()
         })
-        print(f"🤖 Final response: {state}")
-        return state["final_response"]
+
+        return state
 
     
     def _execute_plan(self, plan: List[Dict[str, Any]], user_request: str, analysis: Dict[str, Any]) -> List[ToolResult]:
@@ -848,15 +888,17 @@ class GeneralGroqAgent:
 
         def llm_with_retry(request, content_type, max_retries=3):
             delay = 2
+            response = None
             for attempt in range(max_retries):
                 response = self.llm.generate_content(request, content_type)
-                if not response.content.startswith("Error generating content"):
+                if response and not response.content.startswith("Error generating content"):
                     return response
-                print(f"[WARN] LLM/API error: {response.content}. Retrying in {delay} seconds...")
+                print(f"[WARN] LLM/API error: {response.content if response else 'No response'}. Retrying in {delay} seconds...")
                 time.sleep(delay)
                 delay *= 2
             # All retries failed
-            return response
+            return response if response else LLMResponse(content="Error generating content: No response", confidence=0.0)
+
 
         for idx, step in enumerate(plan):
             try:
@@ -873,8 +915,15 @@ class GeneralGroqAgent:
                         parameters[key] = replace_placeholders(value)
 
                 # Handle content generation with retry
-                if action == "llm_generation":
-                    content_type = "code" if "code" in operation else "general"
+                if action=="web":
+                    tool=self.tools[action]
+                    result = tool.execute(**parameters)
+                    step_outputs[step_num] = result.output
+                    step_data[step_num] = result.data if result.data else {}
+                    results.append(result)
+                # Handle tool execution
+                elif action == "llm_generation":
+                    content_type = "code" if operation and "code" in operation else "general"
                     if "creative" in user_request.lower() or "write" in user_request.lower():
                         content_type = "creative"
                     llm_response = llm_with_retry(parameters.get("request", user_request), content_type)
@@ -895,8 +944,7 @@ class GeneralGroqAgent:
                             output=f"Content generated ({len(llm_response.content)} characters)",
                             data={"content": llm_response.content}
                         ))
-                # Handle tool execution
-                elif action in self.tools:
+                elif action in self.tools and action !="web" and action!="llm_generation":
                     tool = self.tools[action]
                     result = tool.execute(operation, **parameters)
                     # If writing to a file, ensure content is not a placeholder
@@ -1084,8 +1132,15 @@ class AgentCLI:
                     continue
                 
                 # Process regular requests
-                response = self.agent.process_request(user_input)
-                print(f"\n🤖 Agent:\n{response}")
+                state = self.agent.process_request(user_input)
+                final_response=""
+                try:
+                    content=state['history'][-1]['results'][-1].data['content']
+                    final_flag=state['final_response']+"\n\n"
+                    final_response=final_flag+content
+                except:
+                    final_response=state['final_response']
+                print(f"\n🤖 Agent:\n{final_response}")
                 print("\n" + "="*70)
                 
             except KeyboardInterrupt:
